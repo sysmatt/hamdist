@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""
+hamdist - ADIF QSO Distance Calculator
+
+Reads one or more ADIF log files and calculates the great-circle distance
+between each contact's location and the operator's location, producing a
+per-QSO CSV and a per-band summary.
+
+Location resolution priority
+  Their station : GRIDSQUARE field → hamdat ZIP lookup (US) → cty.dat DXCC prefix
+  My station    : MY_GRIDSQUARE field per QSO → --grid CLI fallback → hard error
+
+Author  : Matt Hoskins, K2TTA  <k2tta@arrl.net>
+"""
+
+import argparse
+import csv
+import math
+import re
+import sqlite3
+import sys
+import urllib.request
+from pathlib import Path
+
+VERSION = "dev"
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+
+CTY_DAT_URL      = "https://www.country-files.com/cty/cty.dat"
+CTY_DAT_CACHE    = Path.home() / ".hamdist_cty.dat"   # our own cache; never write to jtcon's
+CTY_DAT_SEARCH   = [
+    CTY_DAT_CACHE,
+    Path.home() / ".jtcon_cty.dat",                   # borrow if present, read-only
+    Path.home() / ".hamdat" / "cty.dat",
+]
+HAMDAT_DB_DEFAULT = Path.home() / ".hamdat" / "hamdat.db"
+PGEOCODE_US_PATH  = Path.home() / ".hamdat" / "pgeocode" / "US.txt"
+CSV_DEFAULT       = Path("hamdist.csv")
+
+# ── Full ADIF band plan (freq in MHz) ─────────────────────────────────────────
+# Source: ADIF spec v3.1.4, section IV — Enumerations, Band
+# Ranges are ITU/IARU allocations; some vary by region (e.g. 60m, 4m).
+
+BAND_PLAN = [
+    (0.1357,     0.1378,     "2190m"),
+    (0.472,      0.479,      "630m"),
+    (0.501,      0.504,      "560m"),
+    (1.8,        2.0,        "160m"),
+    (3.5,        4.0,        "80m"),
+    (5.06,       5.45,       "60m"),
+    (7.0,        7.3,        "40m"),
+    (10.1,       10.15,      "30m"),
+    (14.0,       14.35,      "20m"),
+    (18.068,     18.168,     "17m"),
+    (21.0,       21.45,      "15m"),
+    (24.89,      24.99,      "12m"),
+    (28.0,       29.7,       "10m"),
+    (50.0,       54.0,       "6m"),
+    (70.0,       71.0,       "4m"),
+    (144.0,      148.0,      "2m"),
+    (219.0,      225.0,      "1.25m"),
+    (420.0,      450.0,      "70cm"),
+    (902.0,      928.0,      "33cm"),
+    (1240.0,     1300.0,     "23cm"),
+    (2300.0,     2450.0,     "13cm"),
+    (3300.0,     3500.0,     "9cm"),
+    (5650.0,     5925.0,     "6cm"),
+    (10000.0,    10500.0,    "3cm"),
+    (24000.0,    24250.0,    "1.25cm"),
+    (47000.0,    47200.0,    "6mm"),
+    (75500.0,    81000.0,    "4mm"),
+    (119980.0,   120020.0,   "2.5mm"),
+    (142000.0,   149000.0,   "2mm"),
+    (241000.0,   250000.0,   "1mm"),
+]
+
+ADIF_BANDS   = {b for _, _, b in BAND_PLAN}
+BAND_ORDER   = [b for _, _, b in BAND_PLAN]   # insertion order = frequency order
+
+
+def freq_to_band(mhz_str: str) -> str | None:
+    """Convert ADIF FREQ value (MHz string) to ADIF band name, or None."""
+    try:
+        mhz = float(mhz_str)
+    except (TypeError, ValueError):
+        return None
+    for lo, hi, band in BAND_PLAN:
+        if lo <= mhz <= hi:
+            return band
+    return None
+
+
+# ── Grid square → lat/lon ─────────────────────────────────────────────────────
+
+def grid4_to_latlon(grid: str) -> tuple[float, float] | None:
+    """
+    Convert a Maidenhead grid square to the (lat, lon) center of its 4-char cell.
+    Accepts any length ≥ 4; extra characters beyond the first 4 are ignored.
+    Returns None on malformed input.
+    """
+    g = grid.upper().strip()
+    if len(g) < 4:
+        return None
+    g = g[:4]
+    if not (g[0].isalpha() and g[1].isalpha() and g[2].isdigit() and g[3].isdigit()):
+        return None
+    lon = (ord(g[0]) - ord('A')) * 20 - 180 + int(g[2]) * 2 + 1.0
+    lat = (ord(g[1]) - ord('A')) * 10 - 90  + int(g[3])     + 0.5
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    return lat, lon
+
+
+# ── Great-circle distance ─────────────────────────────────────────────────────
+
+_EARTH_KM = 6371.0
+_KM_TO_MI = 0.621371
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Haversine great-circle distance in km."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return _EARTH_KM * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# ── ADIF parser (adapted from jtcon by sysmatt) ───────────────────────────────
+
+_ADIF_FIELD_RE = re.compile(
+    r"<([A-Za-z_][A-Za-z0-9_]*)(?::[^:>]*)?:(\d+)(?::[A-Za-z])?>",
+    re.IGNORECASE,
+)
+_ADIF_EOH_RE = re.compile(r"<EOH>", re.IGNORECASE)
+_ADIF_EOR_RE = re.compile(r"<EOR>", re.IGNORECASE)
+
+
+def parse_adif(path: Path) -> list[dict]:
+    """Parse an ADIF (.adi) file; return a list of QSO dicts with lowercase keys."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    eoh  = _ADIF_EOH_RE.search(text)
+    body = text[eoh.end():] if eoh else text
+    qsos: list[dict] = []
+    pos = 0
+    current: dict = {}
+    while pos < len(body):
+        m   = _ADIF_FIELD_RE.search(body, pos)
+        eor = _ADIF_EOR_RE.search(body, pos)
+        if eor and (not m or eor.start() < m.start()):
+            if current:
+                qsos.append(current)
+                current = {}
+            pos = eor.end()
+            continue
+        if not m:
+            break
+        field  = m.group(1).lower()
+        flen   = int(m.group(2))
+        vstart = m.end()
+        current[field] = body[vstart: vstart + flen].strip()
+        pos = vstart + flen
+    if current:
+        qsos.append(current)
+    return qsos
+
+
+# ── cty.dat parser (adapted from jtcon by sysmatt) ────────────────────────────
+
+_CTY_OVERRIDE_RE = re.compile(r"[\(\[\{<~][^\)\]\}>~]*[\)\]\}>~]")
+
+
+def _strip_cty_overrides(token: str) -> tuple[str, dict]:
+    overrides: dict = {}
+    m = re.search(r"\((\d+)\)", token)
+    if m:
+        overrides["cqz"] = int(m.group(1))
+    m = re.search(r"\[(\d+)\]", token)
+    if m:
+        overrides["ituz"] = int(m.group(1))
+    m = re.search(r"\{([A-Z]+)\}", token)
+    if m:
+        overrides["continent"] = m.group(1)
+    clean = _CTY_OVERRIDE_RE.sub("", token).strip()
+    return clean, overrides
+
+
+class CtyDat:
+    """AD1C Big CTY cty.dat prefix database."""
+
+    def __init__(self) -> None:
+        self._exact:    dict[str, dict] = {}
+        self._prefixes: list[tuple[str, dict]] = []
+
+    def load(self, path: Path) -> None:
+        self._parse(path.read_text(encoding="utf-8", errors="replace"))
+
+    def _parse(self, text: str) -> None:
+        for record in re.split(r"\n(?=[A-Z*])", text):
+            lines = record.strip().splitlines()
+            if not lines:
+                continue
+            parts = [p.strip() for p in lines[0].split(":")]
+            if len(parts) < 8:
+                continue
+            try:
+                base = {
+                    "country":        parts[0].lstrip("*"),
+                    "cqz":            int(parts[1]),
+                    "ituz":           int(parts[2]),
+                    "continent":      parts[3],
+                    "latitude":       float(parts[4]),
+                    "longitude":      -float(parts[5]),   # cty.dat west = positive
+                    "primary_prefix": parts[7].rstrip(";").strip(),
+                }
+            except (ValueError, IndexError):
+                continue
+            body = " ".join(lines[1:]).split(";")[0]
+            for raw in body.split(","):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                exact = raw.startswith("=")
+                clean, overrides = _strip_cty_overrides(raw.lstrip("="))
+                if not clean:
+                    continue
+                entry = {**base, **overrides}
+                if exact:
+                    self._exact[clean.upper()] = entry
+                else:
+                    self._prefixes.append((clean.upper(), entry))
+        self._prefixes.sort(key=lambda x: len(x[0]), reverse=True)
+
+    def lookup(self, callsign: str) -> dict | None:
+        """Return DXCC entity info for a callsign, or None if not found."""
+        call = callsign.upper().strip()
+        if call in self._exact:
+            return dict(self._exact[call])
+        parts = call.split("/")
+        if len(parts) == 2:
+            a, b = parts
+            portable = {"P", "M", "MM", "AM", "QRP", "QRPP", "A", "B"}
+            if b in portable:
+                call = a
+            elif a in portable:
+                call = b
+            elif len(a) <= 3 and not a[-1].isdigit():
+                r = self._prefix_match(a)
+                if r:
+                    return r
+                call = b
+            else:
+                call = a if len(a) >= len(b) else b
+        return self._prefix_match(call)
+
+    def _prefix_match(self, call: str) -> dict | None:
+        for prefix, entry in self._prefixes:
+            if call.startswith(prefix):
+                return dict(entry)
+        return None
+
+
+# ── cty.dat loader ────────────────────────────────────────────────────────────
+
+def load_cty(cty_arg: Path | None) -> CtyDat:
+    """Find, download if needed, and load cty.dat. Exits on failure."""
+    search = [cty_arg] if cty_arg else CTY_DAT_SEARCH
+    for p in search:
+        if p and p.exists():
+            cty = CtyDat()
+            cty.load(p)
+            return cty
+    dest = CTY_DAT_CACHE
+    print(f"cty.dat not found; downloading → {dest}", file=sys.stderr)
+    try:
+        urllib.request.urlretrieve(CTY_DAT_URL, dest)
+    except Exception as e:
+        sys.exit(f"Failed to download cty.dat: {e}\nProvide one with --cty PATH")
+    cty = CtyDat()
+    cty.load(dest)
+    return cty
+
+
+# ── ZIP → lat/lon (reads pgeocode US.txt seeded by hamdat --pull) ─────────────
+
+_zip_cache: dict[str, tuple[float, float]] | None = None
+
+
+def _load_zip_cache() -> dict[str, tuple[float, float]]:
+    global _zip_cache
+    if _zip_cache is not None:
+        return _zip_cache
+    _zip_cache = {}
+    if not PGEOCODE_US_PATH.exists():
+        return _zip_cache
+    with PGEOCODE_US_PATH.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            try:
+                _zip_cache[row["postal_code"]] = (
+                    float(row["latitude"]),
+                    float(row["longitude"]),
+                )
+            except (KeyError, ValueError):
+                pass
+    return _zip_cache
+
+
+def zip_to_latlon(zipcode: str) -> tuple[float, float] | None:
+    return _load_zip_cache().get(zipcode[:5] if zipcode else "")
+
+
+# ── hamdat callsign → ZIP lookup ──────────────────────────────────────────────
+
+_hamdat_conn: sqlite3.Connection | None = None
+
+
+def _hamdat(db_path: Path) -> sqlite3.Connection | None:
+    global _hamdat_conn
+    if _hamdat_conn is None:
+        _hamdat_conn = sqlite3.connect(str(db_path))
+        _hamdat_conn.row_factory = sqlite3.Row
+    return _hamdat_conn
+
+
+def callsign_to_latlon(raw_call: str, db_path: Path) -> tuple[float, float] | None:
+    """Look up a callsign in hamdat; return ZIP centroid lat/lon or None."""
+    base = raw_call.upper().split("/")[0]
+    conn = _hamdat(db_path)
+    if not conn:
+        return None
+    row = conn.execute(
+        "SELECT e.zip_code FROM entity e "
+        "JOIN license_header h ON e.unique_system_identifier = h.unique_system_identifier "
+        "WHERE h.call_sign = ? AND h.license_status = 'A' "
+        "ORDER BY h.last_action_date DESC LIMIT 1",
+        (base,),
+    ).fetchone()
+    if not row or not row["zip_code"]:
+        return None
+    return zip_to_latlon(row["zip_code"])
+
+
+# ── Location resolution ────────────────────────────────────────────────────────
+
+# Method tags written to the CSV loc_method column
+M_GRID4  = "grid4"   # 4-char grid was present
+M_GRID6  = "grid6+"  # 6+ char grid, truncated to 4
+M_HAMDAT = "hamdat"  # US ZIP lookup via hamdat + pgeocode
+M_DXCC   = "dxcc"   # cty.dat country centroid
+M_MMAM   = "mm/am"  # maritime or aeronautical mobile — no fixed location
+M_UNK    = "unknown"
+
+_UNLOCATABLE_SFXS = {"MM", "AM"}
+
+
+def _is_unlocatable(call: str) -> bool:
+    parts = call.upper().split("/")
+    return any(p in _UNLOCATABLE_SFXS for p in parts)
+
+
+def resolve_their_location(
+    qso: dict, cty: CtyDat, db_path: Path
+) -> tuple[float | None, float | None, str]:
+    raw_grid = qso.get("gridsquare", "").strip()
+    if raw_grid:
+        latlon = grid4_to_latlon(raw_grid)
+        if latlon:
+            method = M_GRID6 if len(raw_grid) >= 6 else M_GRID4
+            return latlon[0], latlon[1], method
+
+    call = qso.get("call", "").strip()
+    if not call:
+        return None, None, M_UNK
+    if _is_unlocatable(call):
+        return None, None, M_MMAM
+
+    latlon = callsign_to_latlon(call, db_path)
+    if latlon:
+        return latlon[0], latlon[1], M_HAMDAT
+
+    info = cty.lookup(call)
+    if info:
+        return info["latitude"], info["longitude"], M_DXCC
+
+    return None, None, M_UNK
+
+
+def resolve_my_location(
+    qso: dict, cli_grid: str | None
+) -> tuple[float | None, float | None]:
+    raw_grid = qso.get("my_gridsquare", "").strip()
+    if raw_grid:
+        latlon = grid4_to_latlon(raw_grid)
+        if latlon:
+            return latlon
+    if cli_grid:
+        latlon = grid4_to_latlon(cli_grid)
+        if latlon:
+            return latlon
+    return None, None
+
+
+# ── Duplicate detection ────────────────────────────────────────────────────────
+
+def dupe_key(qso: dict, band: str | None) -> tuple:
+    """Duplicate = same call + band + mode + UTC date."""
+    return (
+        qso.get("call",     "").strip().upper(),
+        band or "",
+        qso.get("mode",     "").strip().upper(),
+        qso.get("qso_date", "").strip(),
+    )
+
+
+# ── Band resolution ────────────────────────────────────────────────────────────
+
+def resolve_band(qso: dict) -> str:
+    """Derive band from FREQ first; fall back to BAND field."""
+    freq = qso.get("freq", "").strip()
+    if freq:
+        b = freq_to_band(freq)
+        if b:
+            return b
+    raw = qso.get("band", "").strip().lower()
+    return raw if raw in ADIF_BANDS else "unknown"
+
+
+# ── Interesting distance references ──────────────────────────────────────────
+# (ref_km, suffix, label, annotation)
+# suffix "×" for multiples; " " for natural-unit entries (light-seconds).
+# Ratios are always computed in km; unit preference only affects the header line.
+
+DISTANCE_REFS = [
+    (12_742.0,        "×", "through Earth's diameter",  "ref:     12,742 km"),
+    (40_075.017,      "×", "around Earth's equator",    "ref:     40,075 km"),
+    (299_792.458,     " ", "light-seconds of RF path",  "ref:    299,792 km/ls"),
+    (384_400.0,       "×", "to the Moon (one way)",     "ref:    384,400 km"),
+    (768_800.0,       "×", "to the Moon and back",      "ref:    768,800 km"),
+    (149_597_871.0,   "×", "to the Sun (1 AU)",         "ref: 149,597,871 km"),
+]
+
+
+def _fmt_ratio(r: float) -> str:
+    if r >= 100: return f"{r:,.1f}"
+    if r >= 10:  return f"{r:.1f}"
+    if r >= 1:   return f"{r:.2f}"
+    return f"{r:.3f}"
+
+
+def print_distance_comparisons(grand_total_km: float, use_miles: bool) -> None:
+    if grand_total_km <= 0:
+        return
+    total_display = grand_total_km * (_KM_TO_MI if use_miles else 1.0)
+    unit = "mi" if use_miles else "km"
+    sep = "-" * 62
+    print(f"  {total_display:,.1f} {unit} in perspective:")
+    print("  " + sep)
+    for ref_km, suffix, label, annotation in DISTANCE_REFS:
+        ratio_str = _fmt_ratio(grand_total_km / ref_km) + suffix
+        print(f"  {ratio_str:>8}  {label:<32}  ({annotation})")
+    print()
+
+
+# ── Summary output ────────────────────────────────────────────────────────────
+
+def print_summary(
+    band_stats: dict,
+    total_dupes: int,
+    use_miles: bool,
+    files: list[Path],
+    cli_grid: str | None,
+) -> None:
+    unit   = "mi" if use_miles else "km"
+    factor = _KM_TO_MI if use_miles else 1.0
+
+    print("\nhamdist - QSO Distance Summary")
+    print(f"Files : {', '.join(str(f) for f in files)}")
+    if cli_grid:
+        print(f"My QTH: {cli_grid.upper()} (--grid)")
+    print()
+
+    col_w = [6, 6, 6, 12, 14, 8]
+    hdr   = (
+        f"{'Band':>{col_w[0]}}  "
+        f"{'QSOs':>{col_w[1]}}  "
+        f"{'Dupes':>{col_w[2]}}  "
+        f"{'Max ' + unit:>{col_w[3]}}  "
+        f"{'Total ' + unit:>{col_w[4]}}  "
+        f"{'Unknown':>{col_w[5]}}"
+    )
+    sep = "-" * len(hdr)
+    print(hdr)
+    print(sep)
+
+    grand_qsos = grand_max = grand_total = grand_unk = 0
+    printed_bands = BAND_ORDER + ["unknown"]
+    for band in printed_bands:
+        s = band_stats.get(band)
+        if s is None:
+            continue
+        qsos, dupes = s["qsos"], s["dupes"]
+        max_d   = s["max_km"]  * factor
+        total_d = s["total_km"] * factor
+        unk     = s["unknown"]
+        grand_qsos  += qsos
+        grand_max    = max(grand_max, max_d)
+        grand_total += total_d
+        grand_unk   += unk
+        print(
+            f"{band:>{col_w[0]}}  "
+            f"{qsos:>{col_w[1]},}  "
+            f"{dupes:>{col_w[2]},}  "
+            f"{max_d:>{col_w[3]},.1f}  "
+            f"{total_d:>{col_w[4]},.1f}  "
+            f"{unk:>{col_w[5]},}"
+        )
+
+    print(sep)
+    print(
+        f"{'TOTAL':>{col_w[0]}}  "
+        f"{grand_qsos:>{col_w[1]},}  "
+        f"{total_dupes:>{col_w[2]},}  "
+        f"{grand_max:>{col_w[3]},.1f}  "
+        f"{grand_total:>{col_w[4]},.1f}  "
+        f"{grand_unk:>{col_w[5]},}"
+    )
+    print()
+    print_distance_comparisons(grand_total / factor, use_miles)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="hamdist",
+        description="Calculate QSO distances from ADIF log files.",
+        epilog=(
+            "Location priority (their station): GRIDSQUARE → hamdat ZIP → cty.dat DXCC\n"
+            "Location priority (my station)   : MY_GRIDSQUARE per QSO → --grid"
+        ),
+    )
+    ap.add_argument("adif_files", nargs="+", type=Path, metavar="ADIF",
+                    help="Input ADIF file(s)")
+    ap.add_argument("--grid", metavar="GRID",
+                    help="Fallback MY_GRIDSQUARE when not present in log")
+    ap.add_argument("--miles", action="store_true",
+                    help="Report distances in miles (default: km)")
+    ap.add_argument("--include-dupes", action="store_true",
+                    help="Include duplicate QSOs in distance totals")
+    ap.add_argument("--csv", metavar="FILE", type=Path, default=CSV_DEFAULT,
+                    help=f"Per-QSO CSV output path (default: {CSV_DEFAULT})")
+    ap.add_argument("--hamdat-db", type=Path, default=HAMDAT_DB_DEFAULT, metavar="DB",
+                    help=f"hamdat SQLite database (default: {HAMDAT_DB_DEFAULT})")
+    ap.add_argument("--cty", type=Path, metavar="FILE",
+                    help="Path to cty.dat (auto-detected or downloaded if absent)")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    args = ap.parse_args()
+
+    # ── Preflight checks ──────────────────────────────────────────────────────
+    for f in args.adif_files:
+        if not f.exists():
+            sys.exit(f"File not found: {f}")
+
+    if not args.hamdat_db.exists():
+        sys.exit(
+            f"hamdat database not found: {args.hamdat_db}\n"
+            "Run: hamdat --pull"
+        )
+
+    if args.grid and not grid4_to_latlon(args.grid):
+        sys.exit(f"Invalid grid square: {args.grid!r}")
+
+    cty = load_cty(args.cty)
+
+    # ── Process QSOs ──────────────────────────────────────────────────────────
+    csv_rows:   list[dict] = []
+    band_stats: dict[str, dict] = {}
+    seen_keys:  set = set()
+    total_dupes = 0
+
+    for adif_path in args.adif_files:
+        try:
+            qsos = parse_adif(adif_path)
+        except Exception as e:
+            print(f"Warning: cannot read {adif_path}: {e}", file=sys.stderr)
+            continue
+
+        for qso in qsos:
+            call = qso.get("call", "").strip()
+            if not call:
+                continue
+
+            band = resolve_band(qso)
+
+            key = dupe_key(qso, band)
+            is_dupe = key in seen_keys
+            seen_keys.add(key)
+            if is_dupe:
+                total_dupes += 1
+
+            bs = band_stats.setdefault(band, {"qsos": 0, "dupes": 0, "max_km": 0.0, "total_km": 0.0, "unknown": 0})
+
+            if is_dupe:
+                bs["dupes"] += 1
+                if not args.include_dupes:
+                    continue
+
+            # Resolve my location — hard exit on first miss
+            my_lat, my_lon = resolve_my_location(qso, args.grid)
+            if my_lat is None:
+                sys.exit(
+                    f"No MY_GRIDSQUARE in QSO with {call} and no --grid specified.\n"
+                    "Use --grid XXNN to set your location."
+                )
+
+            their_lat, their_lon, loc_method = resolve_their_location(qso, cty, args.hamdat_db)
+
+            dist_km = dist_mi = None
+            if their_lat is not None:
+                dist_km = haversine_km(my_lat, my_lon, their_lat, their_lon)
+                dist_mi = dist_km * _KM_TO_MI
+
+            bs["qsos"] += 1
+            if dist_km is not None:
+                if dist_km > bs["max_km"]:
+                    bs["max_km"] = dist_km
+                bs["total_km"] += dist_km
+            else:
+                bs["unknown"] += 1
+
+            raw_grid = qso.get("gridsquare", "")
+            my_raw   = qso.get("my_gridsquare", "") or (args.grid or "")
+
+            csv_rows.append({
+                "date":        qso.get("qso_date", ""),
+                "time":        qso.get("time_on", ""),
+                "call":        call,
+                "band":        band,
+                "mode":        qso.get("mode", ""),
+                "their_grid":  raw_grid,
+                "their_grid4": raw_grid[:4].upper() if raw_grid else "",
+                "my_grid4":    my_raw[:4].upper() if my_raw else "",
+                "dist_km":     f"{dist_km:.3f}" if dist_km is not None else "",
+                "dist_mi":     f"{dist_mi:.3f}" if dist_mi is not None else "",
+                "loc_method":  loc_method,
+                "dupe":        "Y" if is_dupe else "",
+            })
+
+    # ── Write CSV ─────────────────────────────────────────────────────────────
+    if csv_rows:
+        with args.csv.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+            w.writeheader()
+            w.writerows(csv_rows)
+        print(f"CSV  → {args.csv}")
+    else:
+        print("No QSOs processed.", file=sys.stderr)
+
+    # ── Print summary ─────────────────────────────────────────────────────────
+    print_summary(band_stats, total_dupes, args.miles, args.adif_files, args.grid)
+
+
+if __name__ == "__main__":
+    main()

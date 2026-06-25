@@ -1,0 +1,12 @@
+# hamdist runtime dependencies
+#
+# Python >= 3.10 required (uses union type hints: X | Y)
+#
+# All dependencies are Python standard library — no pip installs needed.
+#
+# External data requirements (not Python packages):
+#   ~/.hamdat/hamdat.db          FCC license database (run: hamdat --pull)
+#   ~/.hamdat/pgeocode/US.txt    US ZIP code centroids (seeded by hamdat --pull)
+#   ~/.jtcon_cty.dat             AD1C cty.dat prefix database
+#                                  (auto-downloaded from country-files.com on first run
+#                                   if not already present from jtcon)
